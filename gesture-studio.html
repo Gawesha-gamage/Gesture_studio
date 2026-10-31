@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gesture Studio</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0f1115; color: #e8eaee;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  .wrap { position: relative; width: 100%; height: 100%; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  video { object-fit: cover; transform: scaleX(-1); opacity: 0.35; }
+  #draw { z-index: 1; }
+  #fx { pointer-events: none; z-index: 2; }
+
+  header { position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;
+    padding: 12px 16px; background: linear-gradient(#0f1115e6, #0f111500); }
+  .left, .right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; }
+  #gesture { font-size: 14px; background: #1c1f25cc; padding: 6px 10px; border-radius: 8px; }
+
+  button { background: #1c1f25; color: #e8eaee; border: 1px solid #2f343d; border-radius: 10px;
+    padding: 8px 13px; font-size: 14px; cursor: pointer; }
+  button:hover { border-color: #3b82f6; }
+  button.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+
+  .controls { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px; z-index: 5; flex-wrap: wrap; justify-content: center; }
+
+  #help { position: absolute; left: 16px; bottom: 16px; font-size: 13px; line-height: 1.7;
+    background: #1c1f25dd; padding: 10px 12px; border-radius: 10px; z-index: 5; max-width: 300px; }
+  #help.hidden { display: none; }
+  #help b { color: #93c5fd; }
+
+  #msg { position: absolute; top: 70px; left: 50%; transform: translateX(-50%);
+    background: #1c1f25ee; padding: 8px 14px; border-radius: 8px; font-size: 15px; z-index: 6;
+    display: none; white-space: nowrap; }
+
+  #notice { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    background: #1c1f25f2; padding: 22px 26px; border-radius: 14px; z-index: 7;
+    max-width: 420px; text-align: center; line-height: 1.5; font-size: 15px; }
+  #notice p { margin: 0 0 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="draw"></canvas>
+  <canvas id="fx"></canvas>
+
+  <header>
+    <div class="left">
+      <h1>Gesture Studio</h1>
+      <button id="modeWrite" class="active">✏️ Writing</button>
+      <button id="modeFx">✨ Effects</button>
+    </div>
+    <div class="right">
+      <div id="gesture">Ready</div>
+      <button id="helpBtn">Help</button>
+    </div>
+  </header>
+
+  <div id="notice">
+    <p id="noticeText">Press <b>Start camera</b> and allow camera access when the browser asks.</p>
+    <button class="active" id="startBtn">Start camera</button>
+  </div>
+
+  <div id="msg"></div>
+
+  <div id="help"><div id="helpBody"></div></div>
+
+  <div class="controls">
+    <button id="clearBtn">Clear</button>
+    <button id="undoBtn">Undo</button>
+    <button id="saveBtn">Save PNG</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('draw');
+  const fx = document.getElementById('fx');
+  const ctx = canvas.getContext('2d');
+  const fctx = fx.getContext('2d');
+  const gestureEl = document.getElementById('gesture');
+  const msgEl = document.getElementById('msg');
+  const notice = document.getElementById('notice');
+  const noticeText = document.getElementById('noticeText');
+  const startBtn = document.getElementById('startBtn');
+  const helpEl = document.getElementById('help');
+  const helpBody = document.getElementById('helpBody');
+  const undoBtn = document.getElementById('undoBtn');
+  const modeWriteBtn = document.getElementById('modeWrite');
+  const modeFxBtn = document.getElementById('modeFx');
+
+  let W = window.innerWidth, H = window.innerHeight;
+  let mode = 'writing';
+
+  // Writing state
+  let strokes = [], current = null, lastPoint = null, palmSince = 0;
+  let mouseDown = false;
+  const COLOR = '#60a5fa', WIDTH = 6;
+
+  // Effects state
+  let parts = [];      // particles
+  let fxList = [];     // larger effects (chakra, shockwave)
+  const cool = {};     // cooldowns per gesture
+  const PAL = ['#f87171', '#fbbf24', '#34d399', '#60a5fa', '#c084fc', '#f472b6', '#ffffff'];
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const pick = arr => arr[(Math.random() * arr.length) | 0];
+  const ease = t => 1 - Math.pow(1 - t, 3);
+
+  const HELP = {
+    writing: `<b>Index finger</b> up: write<br>
+      <b>Index + middle</b>: move without writing<br>
+      <b>Fist</b>: stop writing<br>
+      <b>Open palm</b>, hold 1 sec: clear<br>
+      Mouse also draws.`,
+    effects: `<b>✋ Open palm</b> (hold): Chakra<br>
+      <b>👏 Clap</b> (both hands together): Fireworks<br>
+      <b>✌️ Peace sign</b>: Sparkles<br>
+      <b>☝️ Index finger</b>: Magic trail<br>
+      <b>✊ Fist</b>: Shockwave<br>
+      <b>👍 Thumbs up</b>: Hearts<br>
+      Mouse click: Fireworks`
+  };
+
+  const LABEL = {
+    writing: { point: '✏️ Writing', two: '👆 Moving (not writing)', fist: '✊ Paused', palm: '🖐️ Hold palm to clear', other: '…' },
+    effects: { point: '☝️ Magic trail', two: '✌️ Sparkles', palm: '✋ Chakra (hold palm)', fist: '✊ Shockwave', thumbs: '👍 Hearts', other: '…' }
+  };
+
+  /* ---------- Sizing ---------- */
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
+    for (const c of [canvas, fx]) {
+      c.width = W * dpr; c.height = H * dpr;
+      c.style.width = W + 'px'; c.style.height = H + 'px';
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    redraw();
+  }
+  window.addEventListener('resize', resize);
+
+  /* ---------- Writing helpers ---------- */
+  function redraw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.strokeStyle = COLOR; ctx.lineWidth = WIDTH;
+    for (const s of strokes) {
+      if (s.length < 2) continue;
+      ctx.beginPath();
+      ctx.moveTo(s[0].x, s[0].y);
+      for (let i = 1; i < s.length; i++) ctx.lineTo(s[i].x, s[i].y);
+      ctx.stroke();
+    }
+  }
+  function startStroke(x, y) {
+    current = [{ x, y }];
+    strokes.push(current);
+    lastPoint = { x, y };
+  }
+  function addPoint(x, y) {
+    if (!current) { startStroke(x, y); return; }
+    current.push({ x, y });
+    ctx.strokeStyle = COLOR; ctx.lineWidth = WIDTH; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(lastPoint.x, lastPoint.y);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    lastPoint = { x, y };
+  }
+  function endStroke() { current = null; lastPoint = null; }
+
+  function showMsg(text) {
+    msgEl.textContent = text;
+    msgEl.style.display = 'block';
+    clearTimeout(showMsg._t);
+    showMsg._t = setTimeout(() => (msgEl.style.display = 'none'), 1300);
+  }
+
+  /* ---------- Modes ---------- */
+  function setMode(m) {
+    mode = m;
+    endStroke();
+    palmSince = 0;
+    modeWriteBtn.classList.toggle('active', m === 'writing');
+    modeFxBtn.classList.toggle('active', m === 'effects');
+    undoBtn.style.display = m === 'writing' ? '' : 'none';
+    helpBody.innerHTML = HELP[m];
+    showMsg(m === 'writing' ? 'Writing mode' : 'Effects mode');
+  }
+  modeWriteBtn.onclick = () => setMode('writing');
+  modeFxBtn.onclick = () => setMode('effects');
+  document.getElementById('helpBtn').onclick = () => helpEl.classList.toggle('hidden');
+
+  /* ---------- Gesture recognition ---------- */
+  // Fingertips 8,12,16,20; PIP joints 6,10,14,18. y grows downward, so "up" means tip.y < pip.y.
+  function fingerStates(lm) {
+    const up = (tip, pip) => lm[tip].y < lm[pip].y;
+    return {
+      index: up(8, 6), middle: up(12, 10), ring: up(16, 14), pinky: up(20, 18),
+      thumb: lm[4].y < lm[2].y - 0.03
+    };
+  }
+  function classify(lm) {
+    const f = fingerStates(lm);
+    const n = [f.index, f.middle, f.ring, f.pinky].filter(Boolean).length;
+    if (n === 4) return 'palm';
+    if (n === 0 && f.thumb) return 'thumbs';
+    if (n === 0) return 'fist';
+    if (f.index && !f.middle && !f.ring && !f.pinky) return 'point';
+    if (f.index && f.middle && !f.ring && !f.pinky) return 'two';
+    return 'other';
+  }
+
+  // Only accept a gesture after it has been seen in 4 frames in a row (reduces flicker)
+  let recent = [], stable = 'none';
+  function stabilize(raw) {
+    recent.push(raw);
+    if (recent.length > 4) recent.shift();
+    if (recent.length === 4 && recent.every(v => v === raw)) stable = raw;
+    return stable;
+  }
+  function resetGesture() { recent = []; stable = 'none'; }
+
+  /* ---------- Effects ---------- */
+  function spawn(o) {
+    if (parts.length > 1500) return;
+    parts.push(Object.assign({ x: 0, y: 0, vx: 0, vy: 0, g: 0, ttl: 1, age: 0, size: 3, color: '#fff', char: null }, o));
+  }
+
+  function sparkleAt(x, y, n) {
+    for (let i = 0; i < n; i++) {
+      spawn({
+        x: x + rand(-8, 8), y: y + rand(-8, 8),
+        vx: rand(-0.8, 0.8), vy: rand(-1.2, 0.2), g: 0.02,
+        ttl: rand(0.5, 0.9), size: rand(1.5, 3.5), color: pick(PAL)
+      });
+    }
+  }
+
+  function burst(x, y, n) {
+    const col = pick(PAL);
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, s = rand(2, 7);
+      spawn({
+        x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, g: 0.08,
+        ttl: rand(0.9, 1.6), size: rand(2, 3.5),
+        color: Math.random() < 0.2 ? '#ffffff' : col
+      });
+    }
+  }
+  function fireworks(x, y) {
+    burst(x, y, 70);
+    setTimeout(() => burst(x + rand(-80, 80), y + rand(-60, 40), 50), 280);
+    setTimeout(() => burst(x + rand(-120, 120), y + rand(-100, 60), 50), 560);
+  }
+
+  function hearts(x, y) {
+    for (let i = 0; i < 8; i++) {
+      spawn({
+        x: x + rand(-30, 30), y,
+        vx: rand(-1.2, 1.2), vy: rand(-3, -1.5), g: -0.01,
+        ttl: rand(1.6, 2.4), size: rand(18, 28), char: pick(['❤️', '💖', '💗', '🩷'])
+      });
+    }
+  }
+
+  function shockwave(x, y) {
+    for (let i = 0; i < 24; i++) {
+      const a = i / 24 * Math.PI * 2;
+      spawn({ x, y, vx: Math.cos(a) * 5, vy: Math.sin(a) * 5, g: 0.02, ttl: 0.6, size: 2.5, color: '#93c5fd' });
+    }
+    fxList.push({
+      start: performance.now(), dur: 700,
+      draw: p => {
+        const r = 260 * ease(p);
+        fctx.save();
+        fctx.globalAlpha = 1 - p;
+        fctx.strokeStyle = '#93c5fd';
+        fctx.lineWidth = 8 * (1 - p) + 1;
+        fctx.beginPath(); fctx.arc(x, y, r, 0, Math.PI * 2); fctx.stroke();
+        fctx.restore();
+      }
+    });
+  }
+
+  function drawChakra(x, y, p) {
+    const R = 30 + 170 * ease(Math.min(p * 2.5, 1));
+    const alpha = p < 0.7 ? 1 : (1 - (p - 0.7) / 0.3);
+    fctx.save();
+    fctx.translate(x, y);
+    fctx.rotate(p * Math.PI * 0.5);
+    fctx.globalAlpha = Math.max(0, alpha);
+    const g = fctx.createRadialGradient(0, 0, 0, 0, 0, R);
+    g.addColorStop(0, 'rgba(253,230,138,0.55)');
+    g.addColorStop(1, 'rgba(251,191,36,0)');
+    fctx.fillStyle = g;
+    fctx.beginPath(); fctx.arc(0, 0, R, 0, Math.PI * 2); fctx.fill();
+    fctx.strokeStyle = '#fbbf24';
+    fctx.lineWidth = 2;
+    for (let i = 0; i < 12; i++) {       // 12 petals
+      fctx.save();
+      fctx.rotate(i * Math.PI / 6);
+      fctx.beginPath();
+      fctx.ellipse(0, -R * 0.55, R * 0.14, R * 0.45, 0, 0, Math.PI * 2);
+      fctx.stroke();
+      fctx.restore();
+    }
+    fctx.strokeStyle = '#fde68a';
+    for (const r of [0.35, 0.7, 1]) {    // concentric rings
+      fctx.beginPath(); fctx.arc(0, 0, R * r, 0, Math.PI * 2); fctx.stroke();
+    }
+    fctx.restore();
+  }
+  function chakra(x, y) {
+    for (let i = 0; i < 30; i++) {
+      const a = i / 30 * Math.PI * 2;
+      spawn({ x, y, vx: Math.cos(a) * 3, vy: Math.sin(a) * 3, ttl: 1.2, size: 2.5, color: '#fde68a' });
+    }
+    fxList.push({ start: performance.now(), dur: 2400, draw: p => drawChakra(x, y, p) });
+  }
+
+  function ready(key, ms) {
+    const now = performance.now();
+    if (!cool[key] || now - cool[key] > ms) { cool[key] = now; return true; }
+    return false;
+  }
+
+  /* ---------- Gesture handling ---------- */
+  function handleWriting(g, x, y) {
+    if (g === 'point') {
+      if (!lastPoint) startStroke(x, y); else addPoint(x, y);
+      palmSince = 0;
+      return;
+    }
+    endStroke();
+    if (g === 'palm') {
+      if (!palmSince) palmSince = performance.now();
+      else if (performance.now() - palmSince > 1000) {
+        strokes = []; redraw(); showMsg('Cleared'); palmSince = 0;
+      }
+    } else {
+      palmSince = 0;
+    }
+  }
+
+  function handleEffects(g, x, y) {
+    if (g === 'point') sparkleAt(x, y, 2);
+    else if (g === 'two') sparkleAt(x, y, 4);
+    else if (g === 'palm') {
+      if (ready('palm', 2500)) { chakra(x, y); showMsg('🪷 Chakra'); }
+    } else if (g === 'fist') {
+      if (ready('fist', 900)) { shockwave(x, y); showMsg('💥 Shockwave'); }
+    } else if (g === 'thumbs') {
+      if (ready('thumbs', 900)) { hearts(x, y); showMsg('💖 Hearts'); }
+    }
+  }
+
+  let prevHandDist = null;
+  function checkClap(list) {
+    const a = list[0], b = list[1];
+    const ca = a[9], cb = b[9];                       // middle-finger knuckle of each hand
+    const d = Math.hypot(ca.x - cb.x, ca.y - cb.y);
+    const size = Math.hypot(a[0].x - a[9].x, a[0].y - a[9].y) || 0.2; // hand size for scale
+    if (prevHandDist !== null && prevHandDist > size * 2.2 && d < size * 0.9 && ready('clap', 1200)) {
+      const mx = (1 - (ca.x + cb.x) / 2) * W;
+      const my = ((ca.y + cb.y) / 2) * H;
+      fireworks(mx, my);
+      showMsg('👏 Fireworks!');
+    }
+    prevHandDist = d;
+  }
+
+  function onHands(list) {
+    if (!list.length) {
+      endStroke(); palmSince = 0; prevHandDist = null; resetGesture();
+      gestureEl.textContent = 'No hand detected';
+      return;
+    }
+    if (list.length === 2) {
+      if (mode === 'effects') {
+        checkClap(list);
+        gestureEl.textContent = '👏 Clap both hands for fireworks';
+        return;
+      }
+    } else {
+      prevHandDist = null;
+    }
+
+    const lm = list[0];
+    const g = stabilize(classify(lm));
+    const anchor = (g === 'palm' || g === 'fist') ? lm[9] : lm[8];
+    const x = (1 - anchor.x) * W;                     // video is mirrored, so mirror x
+    const y = anchor.y * H;
+
+    gestureEl.textContent = g === 'none' ? 'Detecting…' : (LABEL[mode][g] || LABEL[mode].other);
+
+    if (mode === 'writing') handleWriting(g, x, y);
+    else handleEffects(g, x, y);
+  }
+
+  /* ---------- Hand model ---------- */
+  let hands = null, handsReady = false, gotResult = false;
+
+  function loadHandModel() {
+    if (typeof Hands === 'undefined') {
+      gestureEl.textContent = 'Hand tracking did not load. Check internet, then reload.';
+      return;
+    }
+    hands = new Hands({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.5
+    });
+    hands.onResults(results => {
+      gotResult = true;
+      onHands(results.multiHandLandmarks || []);
+    });
+    handsReady = true;
+  }
+
+  /* ---------- Camera ---------- */
+  function explainCameraError(err) {
+    const name = err && err.name;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return 'This browser cannot use the camera here. Open the file in Chrome or Edge in its own tab (double-click it).';
+    }
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+      return 'Camera permission was blocked. Click the camera or lock icon in the address bar, set Camera to Allow, then press Start camera again.';
+    }
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+      return 'No camera was found on this device.';
+    }
+    if (name === 'NotReadableError' || name === 'TrackStartError') {
+      return 'The camera is being used by another app (Zoom, Teams, Camera app). Close that app, then press Start camera.';
+    }
+    if (name === 'SecurityError') {
+      return 'The browser blocked the camera for this page. Open the file directly in Chrome or Edge, not inside a preview.';
+    }
+    return 'Could not start the camera (' + (name || 'unknown error') + '). Close other apps using it and try again.';
+  }
+
+  async function startCamera() {
+    startBtn.disabled = true;
+    noticeText.textContent = 'Starting camera… allow access if the browser asks.';
+    try {
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false
+        });
+      } catch (err) {
+        if (err && err.name === 'OverconstrainedError') {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        } else {
+          throw err;
+        }
+      }
+      video.srcObject = stream;
+      await video.play();
+      notice.style.display = 'none';
+      gestureEl.textContent = 'Loading hand model… (first time can take ~20 sec)';
+      loadHandModel();
+      setTimeout(() => {
+        if (!gotResult && handsReady) {
+          gestureEl.textContent = 'Hand model not responding. Check internet, then reload (F5). Mouse still works.';
+        }
+      }, 15000);
+    } catch (err) {
+      console.error(err);
+      noticeText.textContent = explainCameraError(err);
+      startBtn.disabled = false;
+      startBtn.textContent = 'Try again';
+      notice.style.display = 'block';
+      gestureEl.textContent = 'Camera not started (mouse still works)';
+    }
+  }
+  startBtn.addEventListener('click', startCamera);
+
+  /* ---------- Main loop: draws effects and sends video frames to the hand model ---------- */
+  let busy = false, lastT = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - lastT) / 1000, 0.05);
+    lastT = now;
+
+    fctx.clearRect(0, 0, W, H);
+    fxList = fxList.filter(e => {
+      const p = (now - e.start) / e.dur;
+      if (p >= 1) return false;
+      e.draw(p);
+      return true;
+    });
+    fctx.globalAlpha = 1;
+
+    parts = parts.filter(p => {
+      p.age += dt;
+      if (p.age >= p.ttl) return false;
+      p.vy += p.g * dt * 60;
+      p.x += p.vx * dt * 60;
+      p.y += p.vy * dt * 60;
+      fctx.globalAlpha = 1 - p.age / p.ttl;
+      if (p.char) {
+        fctx.font = `${p.size}px serif`;
+        fctx.textAlign = 'center';
+        fctx.textBaseline = 'middle';
+        fctx.fillText(p.char, p.x, p.y);
+      } else {
+        fctx.fillStyle = p.color;
+        fctx.beginPath();
+        fctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        fctx.fill();
+      }
+      return true;
+    });
+    fctx.globalAlpha = 1;
+
+    if (handsReady && !busy && video.readyState >= 2) {
+      busy = true;
+      hands.send({ image: video })
+        .catch(err => console.error('Hand model error:', err))
+        .finally(() => { busy = false; });
+    }
+    requestAnimationFrame(frame);
+  }
+
+  /* ---------- Mouse ---------- */
+  canvas.addEventListener('mousedown', e => {
+    if (mode === 'effects') { fireworks(e.clientX, e.clientY); return; }
+    mouseDown = true;
+    startStroke(e.clientX, e.clientY);
+  });
+  canvas.addEventListener('mousemove', e => {
+    if (mouseDown && mode === 'writing') addPoint(e.clientX, e.clientY);
+  });
+  window.addEventListener('mouseup', () => { mouseDown = false; endStroke(); });
+
+  /* ---------- Buttons ---------- */
+  document.getElementById('clearBtn').onclick = () => { strokes = []; parts = []; fxList = []; redraw(); };
+  undoBtn.onclick = () => { strokes.pop(); redraw(); };
+  document.getElementById('saveBtn').onclick = () => {
+    const out = document.createElement('canvas');
+    out.width = canvas.width; out.height = canvas.height;
+    const o = out.getContext('2d');
+    o.fillStyle = '#0f1115';
+    o.fillRect(0, 0, out.width, out.height);
+    o.drawImage(canvas, 0, 0);
+    const a = document.createElement('a');
+    a.download = 'my-drawing.png';
+    a.href = out.toDataURL('image/png');
+    a.click();
+  };
+
+  resize();
+  setMode('writing');
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
